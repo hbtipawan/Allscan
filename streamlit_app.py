@@ -22,6 +22,7 @@ import vcp_core as vc
 import dhan_data as dd
 import upstox_data as ud
 import marketcap as mcap
+import vpci_scanner as vps
 
 st.set_page_config(page_title="Bullish Scanners", layout="wide", page_icon=":chart_with_upwards_trend:")
 NSE_CSV = "EQUITY_L_2.csv"
@@ -284,7 +285,7 @@ def rev_columns(unit="d"):
 
 # =================================== SIDEBAR ========================================
 st.sidebar.title("Scanner")
-scanner = st.sidebar.radio("Mode", ["Reversal patterns", "VCP breakout"], index=0)
+scanner = st.sidebar.radio("Mode", ["Reversal patterns", "VCP breakout", "VPCI weekly (7-gate)"], index=0)
 source = st.sidebar.radio("Data source", ["Upstox", "Dhan", "Yahoo"], index=0,
             help="Upstox = free, accurate, no token or login needed (recommended). "
                  "Dhan = needs access-token + paid Data API subscription. "
@@ -400,10 +401,11 @@ else:
 
 scan_n = 1; vol_only = False
 near_high = 25; max_tight = 5; min_base = 3; strictness = "Strict"; min_grade = "All (A/B/C)"; status_f = "All"
+vpci_relaxed = False
 if scanner == "Reversal patterns":
     scan_n  = st.sidebar.slider("Scan signals from last N bars", 1, 3, 1)
     vol_only = st.sidebar.checkbox("Show volume-confirmed signals only", value=False)
-else:
+elif scanner == "VCP breakout":
     st.sidebar.markdown("**VCP settings**")
     near_high = st.sidebar.slider("Within % of 52-period high", 5, 40, 12)
     max_tight = st.sidebar.slider("Max base tightness (%)", 2, 10, 5)
@@ -411,6 +413,11 @@ else:
     strictness = st.sidebar.selectbox("Trend strictness", ["Strict", "Standard", "Relaxed"], index=0)
     min_grade = st.sidebar.selectbox("Minimum grade", ["A only", "A & B", "All (A/B/C)"], index=2)
     status_f  = st.sidebar.selectbox("Status", ["All", "Coiling", "Breakout"], index=0)
+else:  # VPCI weekly (7-gate)
+    st.sidebar.markdown("**VPCI settings** (weekly 7-gate)")
+    vpci_relaxed = st.sidebar.toggle("Relaxed mode (allow 6/7 gates)", value=False,
+                    help="Include 6/7 setups that pass the Tier-1 gates (G4 breakout, G5 VPCI, G7 above-40w).")
+    st.sidebar.caption("Always weekly. Earnings-phase tagging and US markets are not included here.")
 
 dft_workers = 5 if source == "Dhan" else 8
 workers = st.sidebar.slider("Fetch threads", 1, 16, dft_workers,
@@ -426,11 +433,17 @@ if scanner == "Reversal patterns":
     st.markdown("Long-only &middot; tabs ordered by historical reversal frequency. Win-% are best-case "
                 "historical frequencies (a ranking aid, not a tradeable win-rate). Every signal passes a "
                 "prior-downtrend location gate.")
-else:
+elif scanner == "VCP breakout":
     st.title("VCP Breakout Scanner")
     st.markdown("High-grade volatility-contraction bases near the highs (Minervini-style). "
                 "**Coiling** = tight base under the pivot; **Breakout** = today cleared the pivot on a "
                 "volume surge. Strict by design.")
+else:
+    st.title("VPCI Weekly 7-Gate Scanner")
+    st.markdown("Weekly trend + volume-price-confirmation engine. A 7/7 stock passes EMA structure, "
+                "price-above-EMA, EMA slope, 13-week breakout, VPCI accumulation, positive relative "
+                "strength, and price above the 40-week MA. Results group into Fresh / Buyable / "
+                "Watchlist / Ranked / G4-pending, plus Sector Leadership & Rotation.")
 st.caption(f"Data source: **{source}**" + {
     "Dhan": "  ·  Dhan historical API (Data API subscription required)",
     "Upstox": "  ·  Upstox historical API (free, no token or login needed)",
@@ -501,7 +514,7 @@ if run:
         st.session_state["res"] = dict(mode="reversal", results=results, scanned=scanned, failed=failed,
                                        scan_n=scan_n, timeframe=timeframe, source=source,
                                        when=dt.datetime.now().strftime("%d %b %Y %H:%M"))
-    else:
+    elif scanner == "VCP breakout":
         years = 3.5 if weekly else 2.2
         yahoo_rng = vc.tf_params(timeframe)["rng"]
         fetch_fn = make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, dhan_token, dhan_client, daystamp)
@@ -519,6 +532,19 @@ if run:
         bar.empty()
         st.session_state["res"] = dict(mode="vcp", cands=cands, scanned=scanned, failed=failed,
                                        timeframe=timeframe, source=source,
+                                       when=dt.datetime.now().strftime("%d %b %Y %H:%M"))
+    else:  # VPCI weekly (7-gate) — always weekly
+        fetch_fn = make_fetch(source, True, 2.6, "2y", "1wk", dhan_token, dhan_client, daystamp)
+        def vprog(done, total): bar.progress(done / total, text=f"Analysed {done}/{total}")
+        with st.spinner(f"Running the weekly 7-gate scan on {n_scan} stocks..."):
+            try:
+                vres, vfailed = vps.run_vpci_scan(rows, fetch_fn, relaxed=vpci_relaxed,
+                                                  workers=base_workers, progress=vprog)
+            except PermissionError as e:
+                bar.empty(); st.error(str(e)); st.stop()
+        bar.empty()
+        st.session_state["res"] = dict(mode="vpci", results=vres, failed=vfailed, exch=exch,
+                                       relaxed=vpci_relaxed, source=source,
                                        when=dt.datetime.now().strftime("%d %b %Y %H:%M"))
 
 # =================================== RENDER =========================================
@@ -587,5 +613,12 @@ elif R and R["mode"] == "vcp" and scanner == "VCP breakout":
     if failed:
         with st.expander(f"{len(failed)} symbols returned no data"):
             st.write(", ".join(failed))
+
+elif R and R["mode"] == "vpci" and scanner == "VPCI weekly (7-gate)":
+    st.caption(f"Last run {R['when']} \u00b7 {R.get('source','')} \u00b7 Weekly \u00b7 7-gate"
+               + ("  \u00b7  relaxed (6/7 allowed)" if R.get("relaxed") else ""))
+    vps.render_vpci(R["results"], R["failed"], R.get("exch", "NSE"),
+                    get_marketcaps=lambda pairs: market_caps(pairs, str(dt.date.today())),
+                    relaxed=R.get("relaxed", False))
 else:
     st.info("Set your universe and options in the sidebar, then press **Run scan**.")
